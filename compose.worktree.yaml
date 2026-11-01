@@ -1,0 +1,40 @@
+# Mount the selected Git worktree into the single desktop stack.
+#
+# Loaded by bin/docker-compose (dev mode only) ONLY when ./.active-src exists,
+# i.e. after `bin/wt init`. Without .active-src this file is inert and the stack
+# keeps using ./src exactly as compose.dev.yaml declares.
+#
+# This file is passed after compose.dev.yaml, so Docker Compose replaces
+# compose.dev.yaml's `./src:/var/www/html` with `./.active-src:/var/www/html`
+# (same container target). Docker resolves the .active-src symlink.
+#
+# A fresh Magento worktree only contains what Git tracks. Repositories that keep
+# a whitelist src/.gitignore (only app/code, app/design, composer.*, pub/*, ...)
+# produce checkouts without app/bootstrap.php, pub/index.php, app/etc/env.php or
+# nginx.conf, so the framework folders below always come from src/. Only
+# DIRECTORIES are mounted inside /var/www/html (Docker creates mount points
+# inside the bind, so a file mount would leave empty files in the worktree);
+# `bin/wt prepare` copies the few required core files.
+#
+# Shared with the main checkout on purpose:
+#   vendor, node_modules  - installed once, reused by every worktree
+#   pub/media             - uploads must match the shared database
+# Kept per worktree on purpose: app/, generated/, var/, pub/static/, composer.*
+services:
+  app:
+    volumes:
+      - ./.active-src:/var/www/html:cached
+      - ./src/pub/media:/var/www/html/pub/media:cached
+
+  phpfpm:
+    volumes:
+      - ./.active-src:/var/www/html:cached
+      - ./src/bin:/var/www/html/bin:cached
+      - ./src/dev:/var/www/html/dev:cached
+      - ./src/lib:/var/www/html/lib:cached
+      - ./src/phpserver:/var/www/html/phpserver:cached
+      - ./src/setup:/var/www/html/setup:cached
+      - ./src/pub/media:/var/www/html/pub/media:cached
+      - ./src/vendor:/var/www/html/vendor:cached
+      - ./src/node_modules:/var/www/html/node_modules:cached
+      - ./conf/php/opcache.ini:/usr/local/etc/php/conf.d/zz-opcache.ini:cached

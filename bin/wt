@@ -1,0 +1,625 @@
+#!/usr/bin/env bash
+# wt - run one markshust/docker-magento stack against many Magento Git worktrees.
+#
+# Layout this CLI expects (all paths relative to the Docker project root):
+#   bin/                       Mark Shust wrappers, untouched
+#   compose.yaml et al.        Docker Compose files, untouched
+#   compose.worktree.yaml      overlay shipped with this CLI (mounts .active-src)
+#   src/                       THE main Magento Git checkout - never moved
+#   .active-src -> <checkout>  what Docker mounts at /var/www/html
+#   .worktrees/<branch>        extra worktrees created by this CLI
+#
+# Framework artifacts stay shared with the main checkout (vendor, node_modules,
+# pub/media) so a new worktree is usable immediately. Everything else - modules,
+# themes, layout, composer.lock - comes from the selected worktree.
+#
+# The database, Redis, OpenSearch and RabbitMQ are shared by design: this is ONE
+# Magento environment that follows the selected source, not parallel sandboxes.
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ "$(basename "$SCRIPT_DIR")" == 'bin' ]]; then
+  PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+else
+  PROJECT_ROOT="$SCRIPT_DIR"
+fi
+MAIN_DIR="$PROJECT_ROOT/src"
+WORKTREES_DIR="$PROJECT_ROOT/.worktrees"
+ACTIVE_LINK="$PROJECT_ROOT/.active-src"
+COMPOSE_WT_FILE="$PROJECT_ROOT/compose.worktree.yaml"
+COMPOSE_WRAPPER="$PROJECT_ROOT/bin/docker-compose"
+MAGENTO_CLI="$PROJECT_ROOT/bin/magento"
+PHP_SERVICES=(app phpfpm phpfpm-xdebug)
+SHARED_SOURCES=(vendor node_modules pub/media)
+# Runtime directories Magento needs in a fresh checkout (all Git-ignored).
+# The shared ones are mounted by compose.worktree.yaml; creating them here keeps
+# their ownership with the host user instead of the Docker daemon (root).
+RUNTIME_DIRS=(app/code app/design app/etc generated var/log var/report pub/static pub/media)
+SHARED_DIRS=(bin dev lib phpserver setup vendor node_modules)
+
+# Untracked Magento core files this repository does not add to Git, copied into a
+# worktree when missing. Paths are relative to the Magento root.
+CORE_FILES=(
+  app/bootstrap.php
+  app/autoload.php
+  app/.htaccess
+  app/etc/NonComposerComponentRegistration.php
+  app/etc/registration_globlist.php
+  app/etc/vendor_path.php
+  app/etc/env.php
+  pub/index.php
+  pub/cron.php
+  pub/get.php
+  pub/health_check.php
+  pub/static.php
+  pub/.htaccess
+  pub/.user.ini
+  .user.ini
+  php.ini
+  nginx.conf.sample
+  package.json
+  Gruntfile.js
+  grunt-config.json
+)
+
+info() { printf '%s\n' "$*"; }
+ok() { printf 'OK: %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/wt <command> [args]
+
+  init                          One-time setup: create .active-src -> src
+  create <branch> [--from REF]  Add a worktree under .worktrees/
+  list                          List worktrees, branches and the active source
+  use <name|path|branch>        Mount that worktree in the ONE Docker stack
+  status                        Show the active source and container state
+  doctor                        Check the installation
+  path <name|path|branch>       Print the absolute path of a worktree
+  prepare <name|path|branch>    Create runtime dirs and copy ignored app/etc/env.php
+  shell <name|path|branch>      Open a shell inside that worktree
+  remove <name>                 Remove an inactive, clean .worktrees/ checkout
+  mounts                        Show the Docker mounts the stack will use
+
+  <name> is 'main', a branch created under .worktrees/, an absolute path, or a
+  Names also resolve from a worktree basename, a branch name or a short alias
+  when the folder lives in a known location.
+  Switching restarts only app/phpfpm; the database stays untouched.
+USAGE
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+compose() {
+  ( cd "$PROJECT_ROOT" && "$COMPOSE_WRAPPER" "$@" )
+}
+
+docker_online() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+require_initialized() {
+  [[ -d "$MAIN_DIR/.git" ]] || die "Missing $MAIN_DIR/.git - expected the main Magento checkout in src/"
+  [[ -L "$ACTIVE_LINK" ]] || die 'Not initialized (no .active-src symlink). Run: bin/wt init'
+  [[ -d "$ACTIVE_LINK" ]] || die ".active-src is broken -> '$(readlink "$ACTIVE_LINK" 2>/dev/null || printf '?')'. Repair it with bin/wt init"
+  git -C "$MAIN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die 'src/ is not a Git work tree of the Magento repository'
+}
+
+valid_branch() {
+  [[ -n "$1" ]] || die 'Missing branch name'
+  git check-ref-format --branch "$1" >/dev/null 2>&1 || die "Invalid Git branch name: '$1'"
+}
+
+worktree_paths() {
+  git -C "$MAIN_DIR" worktree list --porcelain | sed -n 's/^worktree //p'
+}
+
+branch_of() {
+  git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '(unknown)\n'
+}
+
+alias_for() {
+  local path="$1"
+  if [[ "$path" == "$MAIN_DIR" ]]; then printf 'main\n'; return 0; fi
+  if [[ "$path" == "$WORKTREES_DIR/"* ]]; then printf '%s\n' "${path#"$WORKTREES_DIR/"}"; return 0; fi
+  case "$path" in
+    "$PROJECT_ROOT"/src/.worktrees/*)   printf 'srcwt/%s\n' "$(basename "$path")"; return 0 ;;
+    "$PROJECT_ROOT"/.codex-worktrees/*) printf 'local/%s\n' "$(basename "$path")"; return 0 ;;
+  esac
+  # Any other checkout outside the project gets a short "wt/" alias, either from
+  # its own name or - when the checkout points at <name>/src - from <name>.
+  if [[ "$(basename "$path")" == 'src' && "$(dirname "$path")" != "$PROJECT_ROOT" ]]; then
+    printf 'wt/%s\n' "$(basename "$(dirname "$path")")"
+  else
+    printf 'wt/%s\n' "$(basename "$path")"
+  fi
+}
+
+is_owned_worktree() {
+  local path="$1"
+  [[ "$path" == "$MAIN_DIR" ]] && return 0
+  worktree_paths | grep -Fqx "$path"
+}
+
+verify_checkout() {
+  local path="$1"
+  [[ -d "$path" ]] || die "Not a directory: $path"
+  is_owned_worktree "$path" \
+    || die "Not a worktree of the Magento Git repository in src/: $path"
+  [[ -f "$path/composer.json" ]] || die "Missing composer.json - not a Magento root: $path"
+}
+
+resolve_target() {
+  local arg="${1:-}" path match real argbase
+  local -a matches=()
+  [[ -n "$arg" ]] || die 'Missing worktree name, path or branch'
+  # "wt/<name>", "local/<name>" and "srcwt/<name>" are display prefixes only;
+  # the name itself is what identifies the checkout.
+  argbase="${arg#wt/}"; argbase="${argbase#local/}"; argbase="${argbase#srcwt/}"
+
+  if [[ "$arg" == 'main' ]]; then realpath "$MAIN_DIR"; return 0; fi
+  if [[ -d "$arg" ]]; then realpath "$arg"; return 0; fi
+  if [[ -d "$WORKTREES_DIR/$arg" ]]; then realpath "$WORKTREES_DIR/$arg"; return 0; fi
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ "$path" == "$MAIN_DIR" ]] && continue
+    if [[ "$path" == "$arg" \
+       || "$(alias_for "$path")" == "$arg" \
+       || "$(branch_of "$path")" == "$arg" \
+       || "$(basename "$path")" == "$argbase" \
+       || "$(basename "$(dirname "$path")")" == "$argbase" \
+       || "$path" == *"/$arg" || "$path" == *"/$arg/src" ]]; then
+      matches+=("$path")
+    fi
+  done < <(worktree_paths)
+
+  if [[ "${#matches[@]}" -eq 0 ]]; then
+    {
+      printf 'ERROR: Unknown worktree: %s\n' "$arg" >&2
+      printf 'Known worktrees:\n' >&2
+      worktree_paths | while IFS= read -r path; do
+        printf '  %-26s %s\n' "$(alias_for "$path")" "$path" >&2
+      done
+    } >&2
+    exit 1
+  fi
+  if [[ "${#matches[@]}" -gt 1 ]]; then
+    {
+      printf "ERROR: '%s' matches several worktrees; use one of:\n" "$arg" >&2
+      printf '%s\n' "${matches[@]}" | while IFS= read -r path; do
+        printf '  %s\n' "$path" >&2
+      done
+    } >&2
+    exit 1
+  fi
+  realpath "${matches[0]}"
+}
+
+active_path() {
+  ( cd -P "$ACTIVE_LINK" && pwd -P )
+}
+
+active_name() {
+  local active
+  active="$(active_path)"
+  if [[ "$active" == "$MAIN_DIR" ]]; then
+    printf 'main\n'
+  elif [[ "$active" == "$WORKTREES_DIR/"* ]]; then
+    printf '%s\n' "${active#"$WORKTREES_DIR/"}"
+  else
+    alias_for "$active"
+  fi
+}
+
+detect_running_php() {
+  RUNNING_PHP_SERVICES=()
+  docker_online || return 0
+  local running service
+  running="$(compose ps --services --status running)" \
+    || die 'Cannot query Docker Compose; no changes made'
+  for service in "${PHP_SERVICES[@]}"; do
+    if printf '%s\n' "$running" | grep -Fqx "$service"; then
+      RUNNING_PHP_SERVICES+=("$service")
+    fi
+  done
+}
+
+repoint_active() {
+  local target="$1" tmp="$ACTIVE_LINK.tmp.$$"
+  rm -f "$tmp"
+  ln -s "$target" "$tmp" || die "Cannot create symlink: $tmp"
+  if ! mv -Tf "$tmp" "$ACTIVE_LINK" 2>/dev/null; then
+    rm -f "$tmp"
+    die "$ACTIVE_LINK is not a symlink; move it away and run bin/wt init"
+  fi
+}
+
+prepare_local_files() {
+  local dest="$1" dir file copied=0
+  for dir in "${RUNTIME_DIRS[@]}" "${SHARED_DIRS[@]}"; do
+    mkdir -p "$dest/$dir"
+  done
+
+  # Untracked Magento core files: copy them only when the checkout ignores them,
+  # so a copy can never be staged by accident. app/etc/env.php is included here;
+  # it holds the local DB/Redis credentials shared by every worktree.
+  for file in "${CORE_FILES[@]}"; do
+    [[ -f "$MAIN_DIR/$file" ]] || continue
+    [[ -e "$dest/$file" ]] && continue
+    if git -C "$dest" check-ignore -q -- "$file"; then
+      mkdir -p "$dest/$(dirname "$file")"
+      cp -p "$MAIN_DIR/$file" "$dest/$file"
+      copied=$((copied + 1))
+    else
+      warn "$file was NOT copied: $dest does not ignore it"
+    fi
+  done
+
+  # nginx.conf is generated from nginx.conf.sample (or the real config) and is
+  # Git-ignored, but the nginx container cannot start without it.
+  if [[ ! -e "$dest/nginx.conf" ]]; then
+    if [[ -f "$MAIN_DIR/nginx.conf" ]]; then
+      cp -p "$MAIN_DIR/nginx.conf" "$dest/nginx.conf"
+      copied=$((copied + 1))
+    elif [[ -f "$MAIN_DIR/nginx.conf.sample" ]]; then
+      cp -p "$MAIN_DIR/nginx.conf.sample" "$dest/nginx.conf"
+      copied=$((copied + 1))
+    fi
+  fi
+
+  [[ "$copied" -gt 0 ]] && info "Prepared $copied untracked core file(s) in $dest"
+  return 0
+}
+
+warn_lock_mismatch() {
+  local dest="$1"
+  [[ "$dest" != "$MAIN_DIR" ]] || return 0
+  if [[ -f "$MAIN_DIR/composer.lock" && -f "$dest/composer.lock" ]] \
+     && ! cmp -s "$MAIN_DIR/composer.lock" "$dest/composer.lock"; then
+    warn 'composer.lock differs from src/. Shared vendor/ may not match this branch.'
+    warn 'If it breaks, run: bin/cli composer install   (this updates the shared vendor/)'
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+init_cmd() {
+  need_command git
+  [[ -d "$MAIN_DIR" ]] || die "Missing $MAIN_DIR (expected src/ next to this script)"
+  [[ -d "$MAIN_DIR/.git" ]] || die 'src/.git must be a directory: src/ must stay the main Git checkout'
+  [[ -f "$MAIN_DIR/composer.json" ]] || die 'src/composer.json missing; src/ is not a Magento root'
+  if [[ -e "$ACTIVE_LINK" && ! -L "$ACTIVE_LINK" ]]; then
+    die "$ACTIVE_LINK exists and is not a symlink; move it away, then rerun init"
+  fi
+
+  mkdir -p "$WORKTREES_DIR"
+  if [[ -L "$ACTIVE_LINK" ]]; then
+    info "Already initialized. Active source: $(active_name) -> $(readlink "$ACTIVE_LINK")"
+  else
+    ln -s "$MAIN_DIR" "$ACTIVE_LINK" || die 'Cannot create .active-src symlink'
+    info 'Created .active-src -> src (src/ itself is untouched)'
+  fi
+
+  if [[ ! -f "$COMPOSE_WT_FILE" ]]; then
+    warn 'compose.worktree.yaml is missing; Docker keeps mounting ./src and "use" has no effect.'
+  elif ! grep -q '\.active-src:/var/www/html' "$COMPOSE_WT_FILE"; then
+    warn 'compose.worktree.yaml does not mount ./.active-src at /var/www/html.'
+  fi
+  if ! grep -q 'compose.worktree.yaml' "$COMPOSE_WRAPPER" 2>/dev/null; then
+    warn 'bin/docker-compose never loads compose.worktree.yaml; "use" would have no effect.'
+  fi
+
+  if docker_online; then
+    compose config -q >/dev/null 2>&1 || die 'docker compose config is invalid after installing the overlay'
+    info 'OK: docker compose config validates.'
+  else
+    info 'Docker is offline; start the stack later with bin/start.'
+  fi
+  info 'Initialized. src/ stays where it is; .active-src decides what the stack mounts.'
+  info 'Next: bin/wt list    |    bin/wt use <name>    |    bin/wt doctor'
+}
+
+default_base() {
+  local ref remote branch
+  for ref in refs/heads/master refs/heads/main; do
+    if git -C "$MAIN_DIR" rev-parse -q --verify "${ref}^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+  for remote in $(git -C "$MAIN_DIR" remote 2>/dev/null); do
+    for branch in master main; do
+      ref="refs/remotes/$remote/$branch"
+      if git -C "$MAIN_DIR" rev-parse -q --verify "${ref}^{commit}" >/dev/null 2>&1; then
+        printf '%s\n' "$ref"
+        return 0
+      fi
+    done
+  done
+  printf 'HEAD\n'
+}
+
+remote_branch_ref() {
+  local branch="$1" remote
+  for remote in $(git -C "$MAIN_DIR" remote 2>/dev/null); do
+    if git -C "$MAIN_DIR" rev-parse -q --verify "refs/remotes/$remote/$branch^{commit}" >/dev/null 2>&1; then
+      printf 'refs/remotes/%s/%s\n' "$remote" "$branch"
+      return 0
+    fi
+  done
+  return 1
+}
+
+create_cmd() {
+  require_initialized
+  local branch="${1:-}" base='' dest explicit_from=0
+  [[ -n "$branch" ]] || die 'Usage: bin/wt create <branch> [--from REF]'
+  valid_branch "$branch"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || die '--from requires a Git ref'
+        base="$2"; explicit_from=1; shift 2 ;;
+      *) die "Unexpected argument: $1" ;;
+    esac
+  done
+
+  dest="$WORKTREES_DIR/$branch"
+  [[ ! -e "$dest" ]] || die "Path already exists: $dest"
+  [[ -n "$base" ]] || base="$(default_base)"
+  git -C "$MAIN_DIR" rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1 \
+    || die "Base ref does not exist: $base"
+
+  mkdir -p "$(dirname "$dest")"
+  local remote_ref=''
+  if git -C "$MAIN_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$MAIN_DIR" worktree add "$dest" "$branch"
+  elif [[ "$explicit_from" == '0' ]] && remote_ref="$(remote_branch_ref "$branch")"; then
+    git -C "$MAIN_DIR" worktree add --track -b "$branch" "$dest" "$remote_ref"
+  else
+    git -C "$MAIN_DIR" worktree add -b "$branch" "$dest" "$base"
+  fi
+
+  prepare_local_files "$dest"
+  info "Worktree ready: $dest"
+  info "Test it:   bin/wt use '$branch'"
+}
+
+prepare_cmd() {
+  require_initialized
+  local target
+  target="$(resolve_target "${1:-}")"
+  verify_checkout "$target"
+  prepare_local_files "$target"
+  warn_lock_mismatch "$target"
+  info "Prepared: $target"
+}
+
+use_cmd() {
+  require_initialized
+  [[ $# -eq 1 ]] || die 'Usage: bin/wt use <name|path|branch>'
+  local name="$1" target old_target
+  target="$(resolve_target "$name")"
+  verify_checkout "$target"
+  prepare_local_files "$target"
+  warn_lock_mismatch "$target"
+
+  old_target="$(active_path)"
+  if [[ "$target" == "$old_target" ]]; then
+    info "Already the active Docker source: $(active_name)"
+    return 0
+  fi
+
+  detect_running_php
+
+  if [[ "${#RUNNING_PHP_SERVICES[@]}" -gt 0 ]]; then
+    info "Stopping PHP/Nginx only: ${RUNNING_PHP_SERVICES[*]}"
+    compose stop "${RUNNING_PHP_SERVICES[@]}" || die 'Cannot stop services; active source not changed'
+  fi
+
+  repoint_active "$target"
+
+  if [[ "${#RUNNING_PHP_SERVICES[@]}" -gt 0 ]]; then
+    info 'Recreating app/phpfpm mounts; DB, Redis, OpenSearch, RabbitMQ stay up...'
+    if ! compose up -d --no-deps --force-recreate "${RUNNING_PHP_SERVICES[@]}"; then
+      warn 'Docker recreation failed; rolling back the source symlink.'
+      repoint_active "$old_target"
+      compose up -d --no-deps --force-recreate "${RUNNING_PHP_SERVICES[@]}" \
+        || warn 'Service rollback failed; check bin/status and Docker logs.'
+      die 'Switch canceled; previous source was restored'
+    fi
+    if printf '%s\n' "${RUNNING_PHP_SERVICES[@]}" | grep -Fqx 'phpfpm' && [[ -x "$MAGENTO_CLI" ]]; then
+      info 'Cleaning Magento cache (best effort)...'
+      ( cd "$PROJECT_ROOT" && "$MAGENTO_CLI" cache:clean ) \
+        || warn 'Cache clean failed; run bin/magento cache:clean when Magento is ready.'
+    fi
+    info 'Cron and cache watchers run inside phpfpm; restart them if you rely on them (bin/cron start).'
+  else
+    info 'Docker PHP/Nginx not running. Start the stack with: bin/start'
+  fi
+
+  info "Active Docker source: $(active_name) ($target)"
+  info 'Check: bin/magento --version, then open the storefront in your browser'
+}
+
+list_cmd() {
+  require_initialized
+  local path mark
+  info "Active Docker source: $(active_name)"
+  info "Path: $(active_path)"
+  printf '\n%-3s %-28s %-30s %s\n' '' 'ALIAS' 'BRANCH' 'PATH'
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    mark=' '
+    [[ "$path" == "$(active_path)" ]] && mark='*'
+    printf '%-3s %-28s %-30s %s\n' "$mark" "$(alias_for "$path")" "$(branch_of "$path")" "$path"
+  done < <(worktree_paths)
+}
+
+path_cmd() {
+  require_initialized
+  [[ $# -eq 1 ]] || die 'Usage: bin/wt path <name|path|branch>'
+  local target
+  target="$(resolve_target "$1")"
+  verify_checkout "$target"
+  printf '%s\n' "$target"
+}
+
+status_cmd() {
+  require_initialized
+  info "Active Docker source: $(active_name)"
+  info "Path: $(active_path)"
+  info "Branch: $(branch_of "$(active_path)")"
+  info 'Changed files in the active checkout:'
+  git -C "$(active_path)" status --short
+  if docker_online; then
+    info 'Docker services:'
+    compose ps
+  else
+    info 'Docker daemon is offline or inaccessible.'
+  fi
+}
+
+doctor_cmd() {
+  local fail=0 path
+  info '--- Layout ---'
+  if [[ -d "$MAIN_DIR/.git" ]]; then ok 'src/ is the main Magento Git checkout'; else warn 'src/.git is missing'; fail=1; fi
+  if [[ -L "$ACTIVE_LINK" && -d "$ACTIVE_LINK" ]]; then
+    ok ".active-src -> $(readlink "$ACTIVE_LINK")"
+  else
+    warn '.active-src is missing or broken (run bin/wt init)'; fail=1
+  fi
+  if [[ -f "$COMPOSE_WT_FILE" ]] && grep -q '\.active-src:/var/www/html' "$COMPOSE_WT_FILE"; then
+    ok 'compose.worktree.yaml mounts ./.active-src at /var/www/html'
+  else
+    warn 'compose.worktree.yaml missing or not mounting .active-src'; fail=1
+  fi
+  if grep -q 'compose.worktree.yaml' "$COMPOSE_WRAPPER" 2>/dev/null; then
+    ok 'bin/docker-compose loads compose.worktree.yaml'
+  else
+    warn 'bin/docker-compose does not load compose.worktree.yaml'; fail=1
+  fi
+
+  info '--- Shared framework dirs (from src/) ---'
+  local dir file
+  for dir in "${SHARED_DIRS[@]}" pub/media; do
+    if [[ -d "$MAIN_DIR/$dir" ]]; then
+      ok "src/$dir is shared with every worktree"
+    else
+      warn "src/$dir is missing; the mounted stack will not be complete"
+      fail=1
+    fi
+  done
+  for dir in "${SHARED_DIRS[@]}"; do
+    if grep -q "\\./src/$dir:/var/www/html/$dir" "$COMPOSE_WT_FILE" 2>/dev/null; then
+      ok "compose.worktree.yaml mounts src/$dir"
+    else
+      warn "compose.worktree.yaml does not mount src/$dir"; fail=1
+    fi
+  done
+  for file in app/bootstrap.php app/autoload.php app/etc/vendor_path.php; do
+    if [[ -f "$MAIN_DIR/$file" ]]; then
+      ok "src/$file exists (copied by prepare into each worktree)"
+    else
+      warn "src/$file is missing; worktrees cannot boot Magento"; fail=1
+    fi
+  done
+
+  info '--- Active checkout ---'
+  path="$(active_path)"
+  if [[ "$path" == "$MAIN_DIR" ]]; then
+    ok 'active source is main'
+  else
+    verify_checkout "$path" 2>/dev/null || { warn "active path is not a worktree: $path"; fail=1; }
+    [[ -f "$path/app/etc/env.php" ]] || { warn 'active worktree has no app/etc/env.php (use bin/wt prepare)'; fail=1; }
+    [[ -f "$MAIN_DIR/vendor/autoload.php" ]] || { warn 'no shared vendor; run composer install'; fail=1; }
+  fi
+  if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]; then
+    info 'NOTE: active checkout has uncommitted changes (expected while working).'
+  fi
+
+  info '--- Docker ---'
+  if docker_online; then
+    if compose config -q >/dev/null 2>&1; then
+      ok 'docker compose config validates'
+    else
+      warn 'docker compose config is invalid'; fail=1
+    fi
+  else
+    info 'SKIP: Docker daemon offline.'
+  fi
+
+  if [[ "$fail" -ne 0 ]]; then
+    die 'Doctor found problems (see WARN lines above)'
+  fi
+  info 'Doctor: OK'
+}
+
+mounts_cmd() {
+  require_initialized
+  docker_online || die 'Docker daemon is offline'
+  compose config | sed -n '/^  app:/,/^  [a-z]/p;/^  phpfpm:/,/^  [a-z]/p' | sed -n '1,120p'
+}
+
+shell_cmd() {
+  require_initialized
+  local name="${1:-}" target
+  [[ -n "$name" ]] || die 'Usage: bin/wt shell <name|path|branch>'
+  target="$(resolve_target "$name")"
+  verify_checkout "$target"
+  cd "$target"
+  exec "${SHELL:-/bin/bash}"
+}
+
+remove_cmd() {
+  require_initialized
+  local name="${1:-}" target
+  [[ $# -eq 1 && -n "$name" ]] || die 'Usage: bin/wt remove <name>'
+  [[ "$name" != 'main' ]] || die 'Cannot remove the main checkout in src/'
+  target="$WORKTREES_DIR/$name"
+  [[ -d "$target" ]] || die "No worktree under .worktrees: $name"
+  target="$(realpath "$target")"
+  case "$target" in
+    "$WORKTREES_DIR"/*) ;;
+    *) die "Refusing to remove a path outside .worktrees: $target" ;;
+  esac
+  is_owned_worktree "$target" || die "Not a linked worktree of src/: $target"
+  [[ "$(active_path)" != "$target" ]] || die 'Cannot remove the active Docker source; run bin/wt use main first'
+
+  if ! git -C "$MAIN_DIR" worktree remove "$target"; then
+    die "Could not remove $target (uncommitted or untracked files?); the branch was kept"
+  fi
+  rmdir -p "$(dirname "$target")" 2>/dev/null || true
+  info "Removed worktree: $name (local branch kept)"
+}
+
+main() {
+  local action="${1:-help}"
+  [[ $# -gt 0 ]] && shift
+  case "$action" in
+    init)   [[ $# -eq 0 ]] || die 'Usage: bin/wt init'; init_cmd ;;
+    create) create_cmd "$@" ;;
+    prepare) prepare_cmd "$@" ;;
+    list)   [[ $# -eq 0 ]] || die 'Usage: bin/wt list'; list_cmd ;;
+    use|switch) use_cmd "$@" ;;
+    status) [[ $# -eq 0 ]] || die 'Usage: bin/wt status'; status_cmd ;;
+    doctor) [[ $# -eq 0 ]] || die 'Usage: bin/wt doctor'; doctor_cmd ;;
+    mounts) [[ $# -eq 0 ]] || die 'Usage: bin/wt mounts'; mounts_cmd ;;
+    path)   path_cmd "$@" ;;
+    shell)  shell_cmd "$@" ;;
+    remove|rm) remove_cmd "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "Unknown command: $action" ;;
+  esac
+}
+
+main "$@"

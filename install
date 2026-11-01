@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# install - wire worktree switching into an existing Mark Shust docker-magento
+# checkout. Safe to run more than once: it only adds what is missing.
+#
+# Usage: /path/to/docker-magento-worktrees/install [DOCKER_ROOT]
+set -Eeuo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT="${1:-$PWD}"
+cd "$ROOT"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ -f compose.yaml ]]          || fail "compose.yaml not found in $ROOT - pass the docker-magento root as the first argument"
+[[ -f compose.dev.yaml ]]      || fail "compose.dev.yaml not found in $ROOT - this toolkit needs the dev stack"
+[[ -f bin/docker-compose ]]    || fail "bin/docker-compose not found in $ROOT - is this a docker-magento checkout?"
+[[ -e src/.git ]]              || warn "src/ does not look like a Git checkout yet; run bin/setup or clone Magento into src/ before using bin/wt"
+
+# 1. The CLI and the Compose overlay.
+install -m 755 "$HERE/bin/wt" bin/wt
+install -m 644 "$HERE/compose.worktree.yaml" compose.worktree.yaml
+say "installed bin/wt and compose.worktree.yaml"
+
+# 2. Make bin/docker-compose load the overlay after compose.dev.yaml, and only
+#    when .active-src exists. Idempotent: the marker check keeps one copy.
+if grep -q 'compose.worktree.yaml' bin/docker-compose; then
+  say "bin/docker-compose already loads compose.worktree.yaml"
+else
+  cp -p bin/docker-compose bin/docker-compose.bak
+  python3 - bin/docker-compose <<'PY'
+import sys
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+block = '''# Worktree overlay: added last so it wins the /var/www/html volume. Only active
+# after "bin/wt init" created the .active-src symlink, so a project that does not
+# use worktrees behaves exactly as before.
+if [ "$LOAD_DEV_FILES" == "1" ] && [ -L ".active-src" ] && [ -f "compose.worktree.yaml" ]; then
+  COMPOSE_FILES+=("compose.worktree.yaml")
+fi
+'''
+anchor = next(i for i, line in enumerate(lines) if line.startswith('COMPOSE_FILES_PREFIXED=()'))
+lines.insert(anchor, block)
+open(path, 'w').write(''.join(lines))
+PY
+  say "patched bin/docker-compose (backup: bin/docker-compose.bak)"
+fi
+
+# 3. Optional Make target so "make wt use <name>" works like the other targets.
+if [[ -f Makefile ]] && ! grep -q '^wt:' Makefile; then
+  printf '\nwt:\n\t@./bin/wt $(call args)\n' >> Makefile
+  say "added the wt target to Makefile"
+fi
+
+# 4. Keep local state out of Git when the docker root is itself a repository.
+if [[ -d .git ]]; then
+  added=0
+  for entry in '.active-src' '.worktrees/'; do
+    if ! grep -qxF "$entry" .gitignore 2>/dev/null; then
+      printf '%s\n' "$entry" >> .gitignore
+      added=1
+    fi
+  done
+  [[ "$added" == "1" ]] && say "added .active-src and .worktrees/ to .gitignore"
+fi
+
+say ""
+say "Next:"
+say "  bin/wt init     # create .active-src -> src (src stays where it is)"
+say "  bin/wt doctor   # verify the overlay, the mounts and Docker Compose"
+say "  bin/wt help     # all commands"
