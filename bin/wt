@@ -83,9 +83,9 @@ Usage: bin/wt <command> [args]
   remove <name>                 Remove an inactive, clean .worktrees/ checkout
   mounts                        Show the Docker mounts the stack will use
 
-  <name> is 'main', a branch created under .worktrees/, an absolute path, or a
-  Names also resolve from a worktree basename, a branch name or a short alias
-  when the folder lives in a known location.
+  <name> is 'main', a branch under .worktrees/, a branch name, a folder name,
+  an absolute path, or an alias such as 'wt/<name>', 'local/<name>' or
+  'srcwt/<name>' for checkouts created outside .worktrees/.
   Switching restarts only app/phpfpm; the database stays untouched.
 USAGE
 }
